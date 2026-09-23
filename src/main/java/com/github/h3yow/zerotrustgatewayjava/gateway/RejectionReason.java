@@ -1,0 +1,22 @@
+package com.github.h3yow.zerotrustgatewayjava.gateway;
+
+/**
+ * 所有可区分的拒绝原因。
+ */
+public enum RejectionReason {
+    // 鉴权类
+    MISSING_CREDENTIAL,
+    UNKNOWN_CREDENTIAL_TYPE,
+    MALFORMED_CREDENTIAL,
+    SIGNATURE_MISMATCH,
+    CREDENTIAL_EXPIRED,
+    PRINCIPAL_MISMATCH,
+    // 重放 / 篡改类
+    MISSING_REQUEST_ID,
+    MISSING_TIMESTAMP,
+    TIMESTAMP_OUT_OF_WINDOW,
+    REPLAYED_REQUEST,
+    SEQUENCE_REGRESSION,
+    // 限流类
+    RATE_LIMITED
+}
