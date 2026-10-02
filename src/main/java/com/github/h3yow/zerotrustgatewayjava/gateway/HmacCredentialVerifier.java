@@ -26,9 +26,15 @@ public class HmacCredentialVerifier implements CredentialVerifier {
     static final String VERSION_2 = "HMAC2";
 
     private final LocalCredentialRegistry registry;
+    private final CredentialLifecycleManager lifecycleManager;
+    private final GatewayClock clock;
 
-    public HmacCredentialVerifier(LocalCredentialRegistry registry) {
+    public HmacCredentialVerifier(LocalCredentialRegistry registry,
+                                  CredentialLifecycleManager lifecycleManager,
+                                  GatewayClock clock) {
         this.registry = registry;
+        this.lifecycleManager = lifecycleManager;
+        this.clock = clock;
     }
 
     @Override
@@ -78,9 +84,15 @@ public class HmacCredentialVerifier implements CredentialVerifier {
                     version + " 凭证 keyId/主体未在本地登记: keyId=" + keyId + ", subject=" + subject);
         }
 
-        if (System.currentTimeMillis() > expires) {
+        // 服务端集中生命周期：以本地登记为准，优先于凭证头自带的 expires。
+        // HMAC1/HMAC2 归一到同一 subjectId 后走同一套判定。
+        lifecycleManager.enforce(subjectId, clock.nowMillis());
+
+        // 兼容旧语义：客户端凭证头自带的 expires 仍然校验（本地登记未覆盖该主体时有意义）。
+        // 本地 notAfter 与头 expires 同为“过期”类原因，但消息说明各自的判定来源。
+        if (clock.nowMillis() > expires) {
             throw reject(RejectionReason.CREDENTIAL_EXPIRED,
-                    version + " 凭证已于 " + expires + " 过期");
+                    version + " 凭证头自带 expires=" + expires + " 已过期");
         }
 
         String canonical = canonical(version, request, subjectId, expires);

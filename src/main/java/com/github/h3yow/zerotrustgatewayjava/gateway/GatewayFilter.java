@@ -86,6 +86,9 @@ public class GatewayFilter extends OncePerRequestFilter {
         return switch (reason) {
             case MISSING_REQUEST_ID, MISSING_TIMESTAMP -> HttpStatus.BAD_REQUEST;
             case RATE_LIMITED -> HttpStatus.TOO_MANY_REQUESTS;
+            // 达到本地重放记录容量上限：fail-closed，明确以 503 表达“服务端暂时无法安全判定”，
+            // 不静默放过，也与窗口内重复（409）区分。
+            case REPLAY_CAPACITY_EXCEEDED -> HttpStatus.SERVICE_UNAVAILABLE;
             case REPLAYED_REQUEST, SEQUENCE_REGRESSION, TIMESTAMP_OUT_OF_WINDOW -> HttpStatus.CONFLICT;
             default -> HttpStatus.UNAUTHORIZED;
         };
