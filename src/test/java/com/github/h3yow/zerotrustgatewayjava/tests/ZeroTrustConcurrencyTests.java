@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.github.h3yow.zerotrustgatewayjava.gateway.GatewayDecision;
+import com.github.h3yow.zerotrustgatewayjava.gateway.GatewayProperties;
 import com.github.h3yow.zerotrustgatewayjava.gateway.GatewayRequest;
 import com.github.h3yow.zerotrustgatewayjava.gateway.LocalCredentialRegistry;
 import com.github.h3yow.zerotrustgatewayjava.gateway.RateLimiter;
@@ -40,6 +41,8 @@ class ZeroTrustConcurrencyTests {
     private RateLimiter rateLimiter;
     @Autowired
     private ReplayProtector replayProtector;
+    @Autowired
+    private GatewayProperties properties;
 
     @BeforeEach
     void resetState() {
@@ -101,36 +104,46 @@ class ZeroTrustConcurrencyTests {
         GatewayRequest shared = SignedRequestFactory.signed(registry, "HMAC2", "bob",
                 "replay-once", now, 1L, "POST", "/api/echo", SignedRequestFactory.bodySha256("{}"));
 
-        ExecutorService pool = Executors.newFixedThreadPool(threads);
-        CountDownLatch start = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(threads);
-        AtomicInteger allowed = new AtomicInteger();
-        AtomicInteger replayed = new AtomicInteger();
+        // 该用例隔离压测防重放：临时把 bob/共享窗口配额抬到线程数以上，避免限流与重放原因交错，
+        // 用后恢复；限流与重放交错的语义在 RetryAfterRejectionTests 中专门覆盖。
+        long originalQuota = properties.getQuotaPerWindow();
+        properties.setQuotaPerWindow(threads + 10L);
+        rateLimiter.reset();
+        try {
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(threads);
+            AtomicInteger allowed = new AtomicInteger();
+            AtomicInteger replayed = new AtomicInteger();
 
-        for (int i = 0; i < threads; i++) {
-            pool.submit(() -> {
-                try {
-                    start.await();
-                    GatewayDecision d = gateway.evaluate(shared);
-                    if (d.allowed()) {
-                        allowed.incrementAndGet();
-                    } else if (d.reason() == RejectionReason.REPLAYED_REQUEST) {
-                        replayed.incrementAndGet();
+            for (int i = 0; i < threads; i++) {
+                pool.submit(() -> {
+                    try {
+                        start.await();
+                        GatewayDecision d = gateway.evaluate(shared);
+                        if (d.allowed()) {
+                            allowed.incrementAndGet();
+                        } else if (d.reason() == RejectionReason.REPLAYED_REQUEST) {
+                            replayed.incrementAndGet();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    done.countDown();
-                }
-            });
-        }
-        start.countDown();
-        assertTrue(done.await(30, TimeUnit.SECONDS), "并发用例应在超时前完成");
-        pool.shutdownNow();
+                });
+            }
+            start.countDown();
+            assertTrue(done.await(30, TimeUnit.SECONDS), "并发用例应在超时前完成");
+            pool.shutdownNow();
 
-        log.info("并发重放结果: 总线程={}, 放行={}, REPLAYED_REQUEST={}",
-                threads, allowed.get(), replayed.get());
-        assertEquals(1, allowed.get(), "同一 requestId 在并发下只能放行一次");
-        assertEquals(threads - 1, replayed.get(), "其余并发请求必须全部识别为重放");
+            log.info("并发重放结果: 总线程={}, 放行={}, REPLAYED_REQUEST={}",
+                    threads, allowed.get(), replayed.get());
+            assertEquals(1, allowed.get(), "同一 requestId 在并发下只能放行一次");
+            assertEquals(threads - 1, replayed.get(), "其余并发请求必须全部识别为重放");
+        } finally {
+            properties.setQuotaPerWindow(originalQuota);
+            rateLimiter.reset();
+        }
     }
 }

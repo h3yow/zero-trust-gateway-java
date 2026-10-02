@@ -14,8 +14,10 @@ public class GatewayProperties {
     private long quotaPerWindow = 10;
     /** 限流窗口毫秒数。 */
     private long windowMillis = 60_000;
-    /** 时间戳允许偏差毫秒数。 */
+    /** 时间戳允许偏差毫秒数（同时决定重放记录的保留时长）。 */
     private long timestampSkewMillis = 30_000;
+    /** 单个调用主体在窗口内保留的请求标识数量上限；达到上限后新请求被明确拒绝，不静默淘汰有效记录。 */
+    private int replayMaxIdsPerSubject = 10_000;
 
     public String getCredentials() { return credentials; }
     public void setCredentials(String credentials) { this.credentials = credentials; }
@@ -28,4 +30,9 @@ public class GatewayProperties {
 
     public long getTimestampSkewMillis() { return timestampSkewMillis; }
     public void setTimestampSkewMillis(long timestampSkewMillis) { this.timestampSkewMillis = timestampSkewMillis; }
+
+    public int getReplayMaxIdsPerSubject() { return replayMaxIdsPerSubject; }
+    public void setReplayMaxIdsPerSubject(int replayMaxIdsPerSubject) {
+        this.replayMaxIdsPerSubject = replayMaxIdsPerSubject;
+    }
 }

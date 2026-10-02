@@ -78,9 +78,26 @@ public class HmacCredentialVerifier implements CredentialVerifier {
                     version + " 凭证 keyId/主体未在本地登记: keyId=" + keyId + ", subject=" + subject);
         }
 
+        // 服务端集中生命周期：一律以本地登记为准，客户端自带的时间/状态不能覆盖本地结论。
+        // 撤销优先，其次未生效、已失效；两类凭证版本走同一套判定，原因与签名不符/主体不一致明确区分。
+        CredentialLifecycle lifecycle = registry.lifecycleOf(subjectId);
+        CredentialLifecycle.Status localStatus = lifecycle == null
+                ? CredentialLifecycle.Status.ACTIVE : lifecycle.statusAt(System.currentTimeMillis());
+        if (localStatus != CredentialLifecycle.Status.ACTIVE) {
+            RejectionReason reason = switch (localStatus) {
+                case REVOKED -> RejectionReason.CREDENTIAL_REVOKED;
+                case NOT_YET_VALID -> RejectionReason.CREDENTIAL_NOT_YET_VALID;
+                case EXPIRED -> RejectionReason.CREDENTIAL_EXPIRED;
+                default -> throw new IllegalStateException("unreachable");
+            };
+            throw reject(reason, version + " 主体 " + subjectId + " 的凭证在本地登记为 "
+                    + localStatus + "（以服务端生命周期为准）");
+        }
+
+        // 客户端凭证头自带的 expires 仍然校验，但它不能推翻服务端登记的结论
         if (System.currentTimeMillis() > expires) {
             throw reject(RejectionReason.CREDENTIAL_EXPIRED,
-                    version + " 凭证已于 " + expires + " 过期");
+                    version + " 凭证头声明已于 " + expires + " 过期");
         }
 
         String canonical = canonical(version, request, subjectId, expires);

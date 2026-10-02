@@ -47,6 +47,26 @@ public class RateLimiter {
         }
     }
 
+    /**
+     * 归还本线程刚占用的配额：请求通过限流但在后续防重放环节被拒、未真正执行时调用。
+     * 若占用与归还之间窗口已经滚动，则旧窗口的计数本就作废，不再对新窗口做任何扣减。
+     */
+    public void release(String subjectId) {
+        Window window = windows.get(subjectId);
+        if (window == null) {
+            return;
+        }
+        synchronized (window) {
+            long now = System.currentTimeMillis();
+            if (now - window.start >= properties.getWindowMillis()) {
+                return;
+            }
+            if (window.count > 0) {
+                window.count--;
+            }
+        }
+    }
+
     /** 仅供测试：清空计数。 */
     public void reset() {
         windows.clear();

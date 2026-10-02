@@ -35,10 +35,12 @@ public class GatewayFilter extends OncePerRequestFilter {
     private static final String H_SEQUENCE = "X-Sequence";
 
     private final ZeroTrustGateway gateway;
+    private final GatewayProperties properties;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public GatewayFilter(ZeroTrustGateway gateway) {
+    public GatewayFilter(ZeroTrustGateway gateway, GatewayProperties properties) {
         this.gateway = gateway;
+        this.properties = properties;
     }
 
     @Override
@@ -73,6 +75,10 @@ public class GatewayFilter extends OncePerRequestFilter {
     private void writeRejection(HttpServletResponse response, GatewayDecision decision) throws IOException {
         HttpStatus status = mapStatus(decision.reason());
         response.setStatus(status.value());
+        if (decision.reason() == RejectionReason.REPLAY_STORE_FULL) {
+            // 容量满是暂时状态：旧记录最迟在一个时间偏差窗口后到期，提示调用方按该间隔重试
+            response.setHeader("Retry-After", Long.toString(Math.max(1, skewSeconds())));
+        }
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
         Map<String, Object> payload = new LinkedHashMap<>();
@@ -82,10 +88,16 @@ public class GatewayFilter extends OncePerRequestFilter {
         objectMapper.writeValue(response.getOutputStream(), payload);
     }
 
+    private long skewSeconds() {
+        return java.util.concurrent.TimeUnit.MILLISECONDS.toSeconds(
+                properties.getTimestampSkewMillis());
+    }
+
     private static HttpStatus mapStatus(RejectionReason reason) {
         return switch (reason) {
             case MISSING_REQUEST_ID, MISSING_TIMESTAMP -> HttpStatus.BAD_REQUEST;
             case RATE_LIMITED -> HttpStatus.TOO_MANY_REQUESTS;
+            case REPLAY_STORE_FULL -> HttpStatus.SERVICE_UNAVAILABLE;
             case REPLAYED_REQUEST, SEQUENCE_REGRESSION, TIMESTAMP_OUT_OF_WINDOW -> HttpStatus.CONFLICT;
             default -> HttpStatus.UNAUTHORIZED;
         };

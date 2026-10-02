@@ -13,8 +13,10 @@ import org.springframework.context.annotation.Configuration;
 public class GatewayWebConfig {
 
     @Bean
-    public FilterRegistrationBean<GatewayFilter> gatewayFilterRegistration(ZeroTrustGateway gateway) {
-        FilterRegistrationBean<GatewayFilter> registration = new FilterRegistrationBean<>(new GatewayFilter(gateway));
+    public FilterRegistrationBean<GatewayFilter> gatewayFilterRegistration(ZeroTrustGateway gateway,
+                                                                           GatewayProperties properties) {
+        FilterRegistrationBean<GatewayFilter> registration =
+                new FilterRegistrationBean<>(new GatewayFilter(gateway, properties));
         registration.addUrlPatterns("/*");
         registration.setOrder(1);
         return registration;
