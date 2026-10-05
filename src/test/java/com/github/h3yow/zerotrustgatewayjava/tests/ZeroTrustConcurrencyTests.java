@@ -11,6 +11,7 @@ import com.github.h3yow.zerotrustgatewayjava.gateway.RateLimiter;
 import com.github.h3yow.zerotrustgatewayjava.gateway.RejectionReason;
 import com.github.h3yow.zerotrustgatewayjava.gateway.ReplayProtector;
 import com.github.h3yow.zerotrustgatewayjava.gateway.ZeroTrustGateway;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -145,5 +146,91 @@ class ZeroTrustConcurrencyTests {
             properties.setQuotaPerWindow(originalQuota);
             rateLimiter.reset();
         }
+    }
+
+    @Test
+    @DisplayName("混合突发：全新请求与大量“已处理过的同一重复请求”同时到达，全新全部放行、重复全部判重放、放行不超配额")
+    void mixedBurstFreshAllowedDuplicatesReplayedWithinQuota() throws InterruptedException {
+        String body = SignedRequestFactory.bodySha256("{\"mix\":true}");
+        long now = System.currentTimeMillis();
+        int quota = (int) properties.getQuotaPerWindow(); // application.properties: 5，保持原样不抬高
+
+        // 前置：先处理掉一个请求 mix-done，制造“已处理过的同一重复请求”；
+        // 随后仅恢复配额（模拟窗口滚动），去重记录保留——重复判定与配额余量从此刻起解耦。
+        GatewayRequest done = SignedRequestFactory.signed(registry, "HMAC1", "alice",
+                "mix-done", now, null, "POST", "/api/echo", body);
+        GatewayDecision first = gateway.evaluate(done);
+        assertTrue(first.allowed(), "前置请求应放行，实际=" + first.reason());
+        rateLimiter.reset();
+        log.info("混合突发判定依据: 前置请求 mix-done 已执行并登记去重；配额已恢复为 {}", quota);
+
+        // 突发：quota 个全新请求 + 大量 mix-done 的重复提交，同时放行
+        int freshCount = quota;
+        int dupCount = 60;
+        int threads = freshCount + dupCount;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch doneLatch = new CountDownLatch(threads);
+        ConcurrentHashMap<String, GatewayDecision> freshResults = new ConcurrentHashMap<>();
+        ConcurrentLinkedQueue<RejectionReason> dupRejects = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<GatewayDecision> unexpected = new ConcurrentLinkedQueue<>();
+
+        for (int i = 1; i <= freshCount; i++) {
+            String freshId = "mix-fresh-" + i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    // 相同时间戳、不带序号、唯一 requestId：排除序号回退干扰，纯压限流/重放交错
+                    GatewayRequest r = SignedRequestFactory.signed(registry, "HMAC1", "alice",
+                            freshId, now, null, "POST", "/api/echo", body);
+                    freshResults.put(freshId, gateway.evaluate(r));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    doneLatch.countDown();
+                }
+            });
+        }
+        for (int i = 0; i < dupCount; i++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    GatewayDecision d = gateway.evaluate(done);
+                    if (d.allowed()) {
+                        unexpected.add(d);
+                    } else {
+                        dupRejects.add(d.reason());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    doneLatch.countDown();
+                }
+            });
+        }
+        start.countDown();
+        assertTrue(doneLatch.await(30, TimeUnit.SECONDS), "并发用例应在超时前完成");
+        pool.shutdownNow();
+
+        long freshAllowed = freshResults.values().stream().filter(GatewayDecision::allowed).count();
+        long freshRejected = freshCount - freshAllowed;
+        long dupReplayed = dupRejects.stream().filter(r -> r == RejectionReason.REPLAYED_REQUEST).count();
+        long dupRateLimited = dupRejects.stream().filter(r -> r == RejectionReason.RATE_LIMITED).count();
+        log.info("混合突发结果: 全新请求={} (放行={}, 被拒={}), 重复请求={} (REPLAYED={}, RATE_LIMITED={}, 其他={}), 异常放行={}",
+                freshCount, freshAllowed, freshRejected,
+                dupCount, dupReplayed, dupRateLimited, dupRejects.size() - dupReplayed - dupRateLimited,
+                unexpected.size());
+
+        // 1) 重复请求全部稳定判 REPLAYED_REQUEST：即使与全新请求争抢、配额被打满，
+        //    也不能出现 RATE_LIMITED 或原因抖动，更不能被放行
+        assertEquals(dupCount, dupReplayed,
+                "已处理过的重复请求必须全部判 REPLAYED_REQUEST，实际分布: " + dupRejects);
+        assertTrue(unexpected.isEmpty(), "重复请求绝不能被放行: " + unexpected);
+        // 2) 全新请求全部放行：在配额之内且无窗口内重复，不能被同时涌入的重复请求牵连成超限
+        freshResults.forEach((id, d) -> assertTrue(d.allowed(),
+                "全新请求 " + id + " 在配额之内必须放行，实际=" + d.reason()));
+        // 3) 实际上限量守恒：放行数恰好等于全新请求数，且不超过配额
+        assertEquals(freshCount, freshAllowed, "放行数应恰好等于全新请求数");
+        assertTrue(freshAllowed <= quota, "实际放行数不能超过配额");
     }
 }
