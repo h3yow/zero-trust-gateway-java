@@ -142,6 +142,28 @@ class RetryAfterRejectionTests {
     }
 
     @Test
+    @DisplayName("原因稳定：配额已满时，窗口内的重复请求仍判 REPLAYED_REQUEST，不被限流原因盖掉")
+    void duplicateStaysReplayedEvenWhenQuotaExhausted() {
+        String body = SignedRequestFactory.bodySha256("{\"stable\":true}");
+        // 用 5 个唯一请求打满配额（全部真正执行）
+        GatewayRequest first = SignedRequestFactory.signed(registry, "HMAC1", "alice",
+                "stable-1", now + 1, 1L, "POST", "/api/echo", body);
+        assertTrue(gateway.evaluate(first).allowed());
+        for (int i = 2; i <= 5; i++) {
+            assertTrue(gateway.evaluate(SignedRequestFactory.signed(registry, "HMAC1", "alice",
+                    "stable-" + i, now + i, (long) i, "POST", "/api/echo", body)).allowed());
+        }
+        // 此刻配额已耗尽：全新请求会被 RATE_LIMITED……
+        assertRejected(gateway.evaluate(SignedRequestFactory.signed(registry, "HMAC1", "alice",
+                "stable-fresh", now + 6, 6L, "POST", "/api/echo", body)), RejectionReason.RATE_LIMITED);
+        // ……但“已处理过的同一请求”必须稳定判重放，重复提交多少次原因都不漂移
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            assertRejected(gateway.evaluate(first), RejectionReason.REPLAYED_REQUEST);
+        }
+        log.info("原因稳定判定依据: 配额已满时，全新请求 -> RATE_LIMITED，已处理过的重复请求 -> REPLAYED_REQUEST（多次提交结论一致）");
+    }
+
+    @Test
     @DisplayName("并发交错：配额满时同 id 重试全部 RATE_LIMITED 且不留痕；配额恢复后并发重试恰好放行一次")
     void concurrentRateLimitRejectThenRetryAdmitsOnce() throws InterruptedException {
         String body = SignedRequestFactory.bodySha256("{\"race\":true}");

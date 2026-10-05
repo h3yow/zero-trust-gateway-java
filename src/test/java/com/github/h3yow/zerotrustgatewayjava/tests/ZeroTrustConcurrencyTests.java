@@ -146,4 +146,86 @@ class ZeroTrustConcurrencyTests {
             rateLimiter.reset();
         }
     }
+
+    @Test
+    @DisplayName("混合突发：全新请求与大量“已处理过的重复请求”同时涌入——全新全部放行、重复全部判重放、放行不超配额")
+    void mixedBurstOfFreshAndDuplicateRequests() throws InterruptedException {
+        // 使用默认配额（quota-per-window=5），不调高：重复请求必须完全不占配额，
+        // 全新请求在配额内必须全部放行，任何“重复挤占配额”或“重复被误判超限”都会使断言失败。
+        int quota = (int) properties.getQuotaPerWindow();
+        int dupThreads = 64;
+        long now = System.currentTimeMillis();
+        String bodySha = SignedRequestFactory.bodySha256("{\"mixed\":true}");
+
+        // 种子请求：先正常处理一次（占 1 个配额、登记 requestId），之后它的副本都是“窗口内重复”
+        GatewayRequest seed = SignedRequestFactory.signed(registry, "HMAC1", "alice",
+                "mixed-seed", now, null, "POST", "/api/echo", bodySha);
+        GatewayDecision seedDecision = gateway.evaluate(seed);
+        assertTrue(seedDecision.allowed(), "种子请求首次提交应放行，实际=" + seedDecision.reason());
+        log.info("混合突发判定依据: 种子请求 requestId=mixed-seed 已放行并登记，占用配额 1/{}", quota);
+
+        // 突发：quota-1 个全新请求（凑满配额）+ 64 个种子请求的重复副本，同时放行闸门
+        int freshThreads = quota - 1;
+        int total = freshThreads + dupThreads;
+        ExecutorService pool = Executors.newFixedThreadPool(total);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(total);
+        AtomicInteger freshAllowed = new AtomicInteger();
+        AtomicInteger dupReplayed = new AtomicInteger();
+        ConcurrentLinkedQueue<String> unexpected = new ConcurrentLinkedQueue<>();
+
+        for (int i = 0; i < freshThreads; i++) {
+            String requestId = "mixed-fresh-" + i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    // 相同时间戳、不带序号、唯一 requestId：排除序号回退干扰，纯粹压测准入语义
+                    GatewayRequest r = SignedRequestFactory.signed(registry, "HMAC1", "alice",
+                            requestId, now, null, "POST", "/api/echo", bodySha);
+                    GatewayDecision d = gateway.evaluate(r);
+                    if (d.allowed()) {
+                        freshAllowed.incrementAndGet();
+                    } else {
+                        unexpected.add("fresh " + requestId + " -> " + d.reason());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        for (int i = 0; i < dupThreads; i++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    GatewayDecision d = gateway.evaluate(seed); // 已处理过的同一请求
+                    if (!d.allowed() && d.reason() == RejectionReason.REPLAYED_REQUEST) {
+                        dupReplayed.incrementAndGet();
+                    } else {
+                        unexpected.add("dup -> allowed=" + d.allowed() + ", reason=" + d.reason());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        start.countDown();
+        assertTrue(done.await(30, TimeUnit.SECONDS), "并发用例应在超时前完成");
+        pool.shutdownNow();
+
+        log.info("混合突发结果: 全新请求={} 放行={}, 重复副本={} 判重放={}, 意外结果={}",
+                freshThreads, freshAllowed.get(), dupThreads, dupReplayed.get(), unexpected);
+        assertTrue(unexpected.isEmpty(),
+                "全新请求不得被超限/其他原因拒绝，重复副本不得出现重放以外的原因: " + unexpected);
+        assertEquals(freshThreads, freshAllowed.get(),
+                "配额之内的全新请求必须全部放行，不能被同时涌入的重复请求挤成超限");
+        assertEquals(dupThreads, dupReplayed.get(),
+                "已处理过的重复请求必须全部稳定判 REPLAYED_REQUEST，即使配额被打满");
+        int totalAllowed = 1 + freshAllowed.get(); // 种子 + 突发期放行
+        assertTrue(totalAllowed <= quota, "窗口内实际放行总数不得超过配额: " + totalAllowed + " > " + quota);
+        log.info("混合突发放行上限核对: 窗口内实际放行总数={} <= 配额={}", totalAllowed, quota);
+    }
 }

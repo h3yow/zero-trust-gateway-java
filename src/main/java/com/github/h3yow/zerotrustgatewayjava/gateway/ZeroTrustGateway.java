@@ -1,15 +1,26 @@
 package com.github.h3yow.zerotrustgatewayjava.gateway;
 
+import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
  * 判定编排，固定顺序，每一步的拒绝原因彼此可区分：
- * <pre>鉴权(AuthenticationService) -> 限流(RateLimiter) -> 防重放/防篡改(ReplayProtector)</pre>
- * 限流放在防重放提交之前：鉴权失败或被限流而没有真正执行的请求，既不占用去重名额，
- * 也不推进序号水位，配额恢复后调用方拿同一个请求（同 requestId/序号）重试可以正常放行，
- * 不会被误判为重放或序号回退。同一输入在状态一致时结论稳定可复现；输入要素与判定依据都会记录到日志。
+ * <pre>鉴权(AuthenticationService) -> 防重放预判(ReplayProtector.precheck)
+ *      -> 限流(RateLimiter) -> 防重放提交(ReplayProtector.commit)</pre>
+ *
+ * <p>并发准入语义（每主体一把准入锁，锁内完成“预判 -> 占配额 -> 提交”）：
+ * <ul>
+ *   <li>窗口内重复/序号回退/容量满在占用配额之前判定：重复请求即使配额已满也稳定判
+ *       REPLAYED_REQUEST，不会被限流原因盖掉，且全程不触碰配额；</li>
+ *   <li>配额只被“预判通过且确定会真正执行”的请求占用，占用与提交在同一临界区，
+ *       不存在“先占位再归还”的窗口期——并发下配额未真正用满时，全新合法请求不会被
+ *       同时涌入的重复请求挤成超限；</li>
+ *   <li>被限流拒绝的请求不登记 requestId、不推进序号水位，配额恢复后同一请求重试可正常放行；</li>
+ *   <li>同一主体窗口内真正放行的请求数绝不超过配额。</li>
+ * </ul>
+ * 同一输入在状态一致时结论稳定可复现；输入要素与判定依据都会记录到日志。
  */
 @Component
 public class ZeroTrustGateway {
@@ -19,6 +30,8 @@ public class ZeroTrustGateway {
     private final AuthenticationService authenticationService;
     private final ReplayProtector replayProtector;
     private final RateLimiter rateLimiter;
+    /** 每主体准入锁：把“防重放预判 -> 限流占位 -> 防重放提交”合成一个临界区。 */
+    private final ConcurrentHashMap<String, Object> admissionLocks = new ConcurrentHashMap<>();
 
     public ZeroTrustGateway(AuthenticationService authenticationService,
                             ReplayProtector replayProtector,
@@ -59,24 +72,38 @@ public class ZeroTrustGateway {
         log.info("判定依据: 鉴权通过 principal={}/{} via {}",
                 principal.subjectId(), principal.credentialId(), principal.credentialType());
 
-        // 2) 限流：在防重放状态提交之前判定。被限流的请求不真正执行，
-        //    因此既不登记 requestId、也不推进序号水位——配额恢复后同一请求重试可被正常处理。
-        if (!rateLimiter.tryAcquire(principal.subjectId())) {
-            log.info("判定依据: 限流拒绝 reason={}, subject={}", RejectionReason.RATE_LIMITED, principal.subjectId());
-            return GatewayDecision.reject(RejectionReason.RATE_LIMITED,
-                    "主体 " + principal.subjectId() + " 已超出当前窗口配额");
-        }
+        // 2)+3) 准入临界区：同一主体的“防重放预判 -> 限流占位 -> 防重放提交”整体串行。
+        //        预判在占位之前，因此重复/回退/容量满的拒绝与配额完全无涉、原因稳定；
+        //        占位与提交原子完成，被拒请求从不临时占着配额挤压其他请求。
+        Object admissionLock = admissionLocks.computeIfAbsent(principal.subjectId(), k -> new Object());
+        synchronized (admissionLock) {
+            // 2) 防重放预判（只读，不登记、不推进水位）：重复请求即使配额已满也在此稳定判重放
+            RejectionReason replayVerdict = replayProtector.precheck(principal, request);
+            if (replayVerdict != null) {
+                log.info("判定依据: 防重放拒绝 reason={}, subject={}, requestId={}（未触碰配额）",
+                        replayVerdict, principal.subjectId(), request.requestId());
+                return GatewayDecision.reject(replayVerdict,
+                        "请求未通过防重放/防篡改校验: " + replayVerdict);
+            }
 
-        // 3) 防重放/防篡改：只有鉴权通过且拿到配额、确实会被执行的请求才提交去重与水位
-        RejectionReason replayReason = replayProtector.check(principal, request);
-        if (replayReason != null) {
-            log.info("判定依据: 防重放拒绝 reason={}, subject={}, requestId={}",
-                    replayReason, principal.subjectId(), request.requestId());
-            // 已占住的一个配额必须归还：防重放拒绝意味着请求未执行，不能让它消耗调用方额度
-            rateLimiter.release(principal.subjectId());
-            log.info("判定依据: 归还配额 subject={}, reason={}", principal.subjectId(), replayReason);
-            return GatewayDecision.reject(replayReason,
-                    "请求未通过防重放/防篡改校验: " + replayReason);
+            // 3a) 限流：预判通过的全新请求才参与配额判定。被限流的请求不真正执行，
+            //     因此不登记 requestId、不推进水位——配额恢复后同一请求重试可被正常处理。
+            if (!rateLimiter.tryAcquire(principal.subjectId())) {
+                log.info("判定依据: 限流拒绝 reason={}, subject={}", RejectionReason.RATE_LIMITED, principal.subjectId());
+                return GatewayDecision.reject(RejectionReason.RATE_LIMITED,
+                        "主体 " + principal.subjectId() + " 已超出当前窗口配额");
+            }
+
+            // 3b) 防重放提交：与占位在同一临界区，状态与预判一致，正常路径必然提交成功；
+            //     重新判定是兜底，万一失败必须归还刚占的配额（请求未真正执行，不能消耗额度）。
+            RejectionReason commitError = replayProtector.commit(principal, request);
+            if (commitError != null) {
+                rateLimiter.release(principal.subjectId());
+                log.warn("判定依据: 防重放提交兜底拒绝并归还配额 subject={}, reason={}",
+                        principal.subjectId(), commitError);
+                return GatewayDecision.reject(commitError,
+                        "请求未通过防重放/防篡改校验: " + commitError);
+            }
         }
 
         log.info("判定依据: 放行 subject={}, requestId={}", principal.subjectId(), request.requestId());

@@ -28,6 +28,10 @@ import org.springframework.stereotype.Component;
  * 到期队列按过期时间升序，清理为摊销 O(1)，查重为 O(1)，长期高吞吐下记录规模受
  * “窗口 × 容量”双重约束，不会只增不减，判定耗时稳定。
  * 只有通过全部检查的请求才会登记 ID 并推进水位，被拒请求不会污染状态。
+ *
+ * <p>判定与提交可分离：{@link #precheck} 只读预判、{@link #commit} 重新判定并提交，
+ * 供网关在“主体准入锁”内把限流判定夹在两者之间，使重复请求在配额判定时完全不占位；
+ * 单独使用的 {@link #check} 语义不变（判定 + 提交一步完成）。
  */
 @Component
 public class ReplayProtector {
@@ -49,17 +53,65 @@ public class ReplayProtector {
         this.clock = clock;
     }
 
-    /** 校验通过返回 null；否则返回可区分的拒绝原因。 */
+    /** 校验通过返回 null；否则返回可区分的拒绝原因。等价于 precheck 通过后立即 commit。 */
     public RejectionReason check(CallerPrincipal principal, GatewayRequest request) {
         String subject = principal.subjectId();
+        RejectionReason headerMiss = missingHeaderReason(request);
+        if (headerMiss != null) {
+            return headerMiss;
+        }
+        SubjectState state = states.computeIfAbsent(subject, k -> new SubjectState());
+        synchronized (state) {
+            RejectionReason verdict = evaluateLocked(state, subject, request);
+            if (verdict != null) {
+                return verdict;
+            }
+            commitLocked(state, request);
+            return null;
+        }
+    }
 
+    /**
+     * 只读预判（不登记 ID、不推进水位）：与 {@link #check} 完全相同的判定规则，
+     * 但通过后不提交任何状态。配合 {@link #commit} 使用，调用方必须保证同一主体下
+     * “precheck -> （限流等中间判定） -> commit” 整体串行（见 ZeroTrustGateway 的主体准入锁），
+     * 使 commit 时状态与 precheck 一致，commit 必然成功。
+     * 用途：让“窗口内重复/序号回退/容量满”在被限流判定之前就给出确定结论——
+     * 重复请求即使配额已满也稳定判 REPLAYED_REQUEST，且全程不触碰配额。
+     */
+    public RejectionReason precheck(CallerPrincipal principal, GatewayRequest request) {
+        String subject = principal.subjectId();
+        RejectionReason headerMiss = missingHeaderReason(request);
+        if (headerMiss != null) {
+            return headerMiss;
+        }
+        SubjectState state = states.computeIfAbsent(subject, k -> new SubjectState());
+        synchronized (state) {
+            return evaluateLocked(state, subject, request);
+        }
+    }
+
+    /**
+     * 提交登记：重新完整判定（与 {@link #check} 相同），通过后原子登记 ID 并推进水位。
+     * 在主体准入锁内调用时，若此前的 {@link #precheck} 已通过则此处必然通过；
+     * 重新判定是兜底，保证任何调用路径下都不会跳过检查直接登记。
+     */
+    public RejectionReason commit(CallerPrincipal principal, GatewayRequest request) {
+        return check(principal, request);
+    }
+
+    private static RejectionReason missingHeaderReason(GatewayRequest request) {
         if (request.requestId() == null || request.requestId().isBlank()) {
             return RejectionReason.MISSING_REQUEST_ID;
         }
         if (request.timestamp() == null) {
             return RejectionReason.MISSING_TIMESTAMP;
         }
+        return null;
+    }
 
+    /** 临界区内的完整判定（调用方须已持有 state 监视器锁）；通过返回 null，不产生任何提交。 */
+    private RejectionReason evaluateLocked(SubjectState state, String subject, GatewayRequest request) {
         long now = clock.millis();
         long skew = properties.getTimestampSkewMillis();
         long ts = request.timestamp();
@@ -67,57 +119,57 @@ public class ReplayProtector {
             log.warn("时间窗口拒绝: subject={}, ts={}, now={}, skew={}", subject, ts, now, skew);
             return RejectionReason.TIMESTAMP_OUT_OF_WINDOW;
         }
-
-        SubjectState state = states.computeIfAbsent(subject, k -> new SubjectState());
         String requestId = request.requestId();
 
-        synchronized (state) {
-            // 1) 时效收敛：清理越过窗口的陈旧记录（expiry 基于请求自身时间戳 ts+skew）
-            int evicted = state.evictExpired(now);
-            if (evicted > 0) {
-                log.info("重放记录时效清理: subject={}, evicted={}, retained={}",
-                        subject, evicted, state.seenIds.size());
-            }
+        // 1) 时效收敛：清理越过窗口的陈旧记录（expiry 基于请求自身时间戳 ts+skew）
+        int evicted = state.evictExpired(now);
+        if (evicted > 0) {
+            log.info("重放记录时效清理: subject={}, evicted={}, retained={}",
+                    subject, evicted, state.seenIds.size());
+        }
 
-            // 2) 窗口内重放一律拦截（陈旧记录已在上一步移除，不会误伤窗口后的新请求）
-            if (state.seenIds.containsKey(requestId)) {
-                long expiry = state.seenIds.get(requestId);
-                log.warn("重放拒绝: subject={}, requestId={}, expiresAt={}, now={}",
-                        subject, requestId, expiry, now);
-                return RejectionReason.REPLAYED_REQUEST;
-            }
+        // 2) 窗口内重放一律拦截（陈旧记录已在上一步移除，不会误伤窗口后的新请求）
+        if (state.seenIds.containsKey(requestId)) {
+            long expiry = state.seenIds.get(requestId);
+            log.warn("重放拒绝: subject={}, requestId={}, expiresAt={}, now={}",
+                    subject, requestId, expiry, now);
+            return RejectionReason.REPLAYED_REQUEST;
+        }
 
-            // 3) 单调水位：先比时间戳，相同时间戳再比序号；未携带序号时只要求时间戳不回退
-            if (state.lastTimestamp != Long.MIN_VALUE) {
-                boolean regression = ts < state.lastTimestamp
-                        || (ts == state.lastTimestamp
-                            && request.sequence() != null
-                            && state.lastSequence != null
-                            && request.sequence() <= state.lastSequence);
-                if (regression) {
-                    log.warn("序号/时间回退拒绝: subject={}, ts={} (last={}), seq={} (last={})",
-                            subject, ts, state.lastTimestamp, request.sequence(), state.lastSequence);
-                    return RejectionReason.SEQUENCE_REGRESSION;
-                }
+        // 3) 单调水位：先比时间戳，相同时间戳再比序号；未携带序号时只要求时间戳不回退
+        if (state.lastTimestamp != Long.MIN_VALUE) {
+            boolean regression = ts < state.lastTimestamp
+                    || (ts == state.lastTimestamp
+                        && request.sequence() != null
+                        && state.lastSequence != null
+                        && request.sequence() <= state.lastSequence);
+            if (regression) {
+                log.warn("序号/时间回退拒绝: subject={}, ts={} (last={}), seq={} (last={})",
+                        subject, ts, state.lastTimestamp, request.sequence(), state.lastSequence);
+                return RejectionReason.SEQUENCE_REGRESSION;
             }
+        }
 
-            // 4) 容量收敛：过期记录已清完仍达上限 → 明确拒绝，不静默放过、不淘汰有效记录
-            int max = properties.getReplayMaxIdsPerSubject();
-            if (state.seenIds.size() >= max) {
-                log.warn("重放容量拒绝: subject={}, retained={}, capacity={}, requestId={}",
-                        subject, state.seenIds.size(), max, requestId);
-                return RejectionReason.REPLAY_STORE_FULL;
-            }
+        // 4) 容量收敛：过期记录已清完仍达上限 → 明确拒绝，不静默放过、不淘汰有效记录
+        int max = properties.getReplayMaxIdsPerSubject();
+        if (state.seenIds.size() >= max) {
+            log.warn("重放容量拒绝: subject={}, retained={}, capacity={}, requestId={}",
+                    subject, state.seenIds.size(), max, requestId);
+            return RejectionReason.REPLAY_STORE_FULL;
+        }
+        return null;
+    }
 
-            // 5) 通过：原子登记 + 推进水位（任何被拒路径都不会执行到这里）
-            long expiry = ts + skew;
-            state.seenIds.put(requestId, expiry);
-            state.expiryQueue.addLast(new ExpiryEntry(expiry, requestId));
-            state.lastTimestamp = ts;
-            if (request.sequence() != null) {
-                state.lastSequence = request.sequence();
-            }
-            return null;
+    /** 临界区内的提交（调用方须已持有 state 监视器锁且判定已通过）：登记 ID + 推进水位。 */
+    private void commitLocked(SubjectState state, GatewayRequest request) {
+        long skew = properties.getTimestampSkewMillis();
+        long ts = request.timestamp();
+        long expiry = ts + skew;
+        state.seenIds.put(request.requestId(), expiry);
+        state.expiryQueue.addLast(new ExpiryEntry(expiry, request.requestId()));
+        state.lastTimestamp = ts;
+        if (request.sequence() != null) {
+            state.lastSequence = request.sequence();
         }
     }
 
